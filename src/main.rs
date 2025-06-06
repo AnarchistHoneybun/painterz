@@ -2,7 +2,7 @@ use clap::Parser;
 use image::{ImageReader, RgbImage};
 use minifb::{Key, Window, WindowOptions};
 use rand::Rng;
-use std::path::{PathBuf, Path};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 struct Args {
@@ -28,6 +28,7 @@ fn main() {
     let mut approx = Image::from(RgbImage::new(width, height));
 
     let mut canvas = vec![0; (width * height) as usize];
+    let mut stroke_count = 0; // Track progress for brush size progression
 
     let mut window = Window::new(
         "brushez",
@@ -35,13 +36,14 @@ fn main() {
         height as usize,
         WindowOptions::default(),
     )
-        .unwrap();
+    .unwrap();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let mut improvements_this_frame = 0;
 
         for _ in 0..args.iterations {
-            if tick(&target, &mut approx) {
+            if tick(&target, &mut approx, stroke_count) {
+                stroke_count += 1;
                 improvements_this_frame += 1;
                 // Update display more frequently for smoother brush strokes
                 if improvements_this_frame % 10 == 0 {
@@ -80,13 +82,626 @@ fn main() {
         std::fs::create_dir_all("generated_images").expect("Failed to create output directory");
 
         // Save the image
-        output_image.save(&output_filename).expect("Failed to save output image");
+        output_image
+            .save(&output_filename)
+            .expect("Failed to save output image");
         println!("Saved final image to: {}", output_filename);
     }
 }
 
-fn calculate_weighted_stroke_color(target: &Image, stroke_points: &[[isize; 2]]) -> [u8; 3] {
-    // Calculate average color along the stroke for better approximation
+fn tick(target: &Image, approx: &mut Image, stroke_count: usize) -> bool {
+    let mut rng = rand::thread_rng();
+
+    // Progressive brush sizing - start with large strokes, get smaller over time
+    let max_strokes_for_progression = 5000; // After this many strokes, use minimum sizes
+    let progress = (stroke_count as f32 / max_strokes_for_progression as f32).min(1.0);
+
+    // Length progression: start large (1/4 image size), end small (1/12 image size)
+    let max_length_start = (target.width.min(target.height) / 2) as isize;
+    let max_length_end = (target.width.min(target.height) / 12) as isize;
+    let max_length =
+        (max_length_start as f32 * (1.0 - progress) + max_length_end as f32 * progress) as isize;
+
+    // Width progression: start thick (50 pixels), end thin (2 pixels)
+    let max_width_start = 200;
+    let max_width_end = 5;
+    let max_width =
+        (max_width_start as f32 * (1.0 - progress) + max_width_end as f32 * progress) as isize;
+
+    // Random start point
+    let start_x = rng.gen_range(0..target.width) as isize;
+    let start_y = rng.gen_range(0..target.height) as isize;
+
+    // Random angle (0 to 2π)
+    let angle = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
+
+    // Random length within current progression bounds
+    let length = rng.gen_range(3..=max_length.max(3) as usize) as isize;
+
+    // Random brush width within current progression bounds
+    let width = rng.gen_range(1..=max_width.max(1) as usize) as isize;
+
+    // Generate interval spline brush stroke
+    let stroke = generate_interval_spline_stroke(start_x, start_y, angle, length, width, &mut rng);
+    
+    // Calculate weighted average color with center bias
+    let color = calculate_weighted_stroke_color_with_center_bias(target, &stroke);
+
+    // Generate all points that would be affected by the brush stroke
+    let changes = stroke.points
+        .into_iter()
+        .filter(|&[x, y]| {
+            x >= 0 && y >= 0 && x < target.width as isize && y < target.height as isize
+        })
+        .map(|[x, y]| ([x as u32, y as u32], color));
+
+    // Check if drawing this brush stroke would improve the approximation
+    let loss_delta = Image::loss_delta(target, approx, changes.clone());
+
+    if loss_delta >= 0.0 {
+        return false;
+    }
+
+    // Apply the changes if the brush stroke improves the approximation
+    approx.apply(changes);
+    true
+}
+
+// ============================================================================
+// COMPLETE INTERVAL SPLINE IMPLEMENTATION (Following the Paper)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct Point2D {
+    x: f32,
+    y: f32,
+}
+
+impl Point2D {
+    fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+// Control shape as described in the paper - stores interval information
+#[derive(Clone, Debug)]
+struct ControlShape {
+    center: Point2D,
+    width_interval: [f32; 2],  // [min_width, max_width] - the interval part
+    height_interval: [f32; 2], // [min_height, max_height] - NOW USED for elliptical shapes
+    angle: f32,                // Orientation of the control shape
+    pressure: f32,             // Brush pressure at this point - NOW USED for density
+}
+
+impl ControlShape {
+    fn new(center: Point2D, width: f32, height: f32, angle: f32, pressure: f32) -> Self {
+        // Create intervals with variation for natural brush effects
+        let width_var = width * 0.15; // 15% variation
+        let height_var = height * 0.1; // 10% variation for height
+        
+        Self {
+            center,
+            width_interval: [width - width_var, width + width_var],
+            height_interval: [height - height_var, height + height_var],
+            angle,
+            pressure,
+        }
+    }
+    
+    // Get actual width/height considering intervals and pressure
+    fn effective_width(&self) -> f32 {
+        let base_width = (self.width_interval[0] + self.width_interval[1]) / 2.0;
+        base_width * self.pressure.sqrt() // Pressure affects effective width
+    }
+    
+    fn effective_height(&self) -> f32 {
+        let base_height = (self.height_interval[0] + self.height_interval[1]) / 2.0;
+        base_height * self.pressure.sqrt() // Pressure affects effective height
+    }
+}
+
+// Interval spline curve representation
+struct IntervalSplineCurve {
+    control_shapes: Vec<ControlShape>, // NOW USED for interpolation
+    upper_boundary: Vec<Point2D>,
+    lower_boundary: Vec<Point2D>,
+    centerline: Vec<Point2D>,
+}
+
+// Final stroke representation
+struct BrushStroke {
+    points: Vec<[isize; 2]>,
+    centerline: Vec<Point2D>,
+    control_shapes: Vec<ControlShape>, // Store for color sampling
+}
+
+fn generate_interval_spline_stroke(
+    start_x: isize,
+    start_y: isize,
+    angle: f32,
+    length: isize,
+    base_width: isize,
+    rng: &mut impl Rng,
+) -> BrushStroke {
+    // Step 1: Generate control shapes along the stroke path
+    let control_shapes = generate_control_shapes(
+        start_x as f32, 
+        start_y as f32, 
+        angle, 
+        length as f32, 
+        base_width as f32, 
+        rng
+    );
+    
+    // Step 2: Create interval spline curve from control shapes
+    let interval_curve = create_interval_spline_curve(&control_shapes);
+    
+    // Step 3: Rasterize the interval curve to get final stroke points
+    let mut stroke = rasterize_interval_spline(&interval_curve);
+    
+    // Step 4: Apply dry brush effects sparingly (15% chance)
+    if rng.random::<f32>() < 0.15 {
+        apply_dry_brush_effect(&mut stroke, rng);
+    }
+    
+    stroke
+}
+
+fn generate_control_shapes(
+    start_x: f32,
+    start_y: f32,
+    base_angle: f32,
+    length: f32,
+    base_width: f32,
+    rng: &mut impl Rng,
+) -> Vec<ControlShape> {
+    let num_shapes = 5; // Number of control shapes along the stroke
+    let mut shapes = Vec::new();
+    
+    for i in 0..num_shapes {
+        let t = i as f32 / (num_shapes - 1) as f32; // 0.0 to 1.0 along stroke
+        
+        // Base position along the intended stroke path
+        let base_x = start_x + t * length * base_angle.cos();
+        let base_y = start_y + t * length * base_angle.sin();
+        
+        // Add natural curvature (more in middle, less at ends)
+        let curve_influence = (t * (1.0 - t) * 4.0).min(1.0);
+        let perp_angle = base_angle + std::f32::consts::PI / 2.0;
+        let curve_strength = rng.gen_range(-0.3..=0.3) * length * curve_influence;
+        
+        let center_x = base_x + curve_strength * perp_angle.cos();
+        let center_y = base_y + curve_strength * perp_angle.sin();
+        
+        // Natural width tapering (as described in paper)
+        let taper_factor = calculate_natural_taper(t);
+        let width_variation = 1.0 + rng.gen_range(-0.2..=0.2);
+        let width = base_width * taper_factor * width_variation;
+        
+        // Height is typically smaller than width for realistic brush shapes
+        let height = width * rng.gen_range(0.4..=0.8);
+        
+        // Pressure simulation (starts high, ends low, with variation)
+        let pressure = if t < 0.1 {
+            1.0 // High pressure at start
+        } else if t > 0.8 {
+            0.2 + (1.0 - t) * 0.8 // Tapers off at end
+        } else {
+            0.7 + rng.gen_range(-0.3..=0.3) // Middle variation
+        }.clamp(0.1, 1.0);
+        
+        // Slight angle variation for organic feel
+        let shape_angle = base_angle + rng.gen_range(-0.2..=0.2);
+        
+        shapes.push(ControlShape::new(
+            Point2D::new(center_x, center_y),
+            width,
+            height,
+            shape_angle,
+            pressure,
+        ));
+    }
+    
+    shapes
+}
+
+fn calculate_natural_taper(t: f32) -> f32 {
+    // Natural brush taper: starts thick, stays thick in middle, tapers at end
+    if t < 0.15 {
+        // Gentle start taper
+        0.7 + 0.3 * (t / 0.15).powi(2)
+    } else if t > 0.75 {
+        // Strong end taper (exponential for natural brush lift)
+        let end_t = (t - 0.75) / 0.25;
+        (1.0 - end_t).powi(3) * 0.9 + 0.1
+    } else {
+        // Full width in middle with slight variation
+        1.0
+    }
+}
+
+fn create_interval_spline_curve(control_shapes: &[ControlShape]) -> IntervalSplineCurve {
+    if control_shapes.len() < 2 {
+        return IntervalSplineCurve {
+            control_shapes: control_shapes.to_vec(),
+            upper_boundary: Vec::new(),
+            lower_boundary: Vec::new(),
+            centerline: Vec::new(),
+        };
+    }
+    
+    let num_samples = 100; // High resolution for smooth curves
+    let mut centerline = Vec::new();
+    let mut upper_boundary = Vec::new();
+    let mut lower_boundary = Vec::new();
+    
+    // Generate interpolated curves using Catmull-Rom splines
+    for i in 0..num_samples {
+        let t = i as f32 / (num_samples - 1) as f32;
+        
+        // Interpolate center position
+        let center = interpolate_center_catmull_rom(control_shapes, t);
+        centerline.push(center);
+        
+        // Interpolate width, height, and angle at this position using control shapes
+        let width = interpolate_width_from_shapes(control_shapes, t);
+        let height = interpolate_height_from_shapes(control_shapes, t);
+        let angle = interpolate_angle_from_shapes(control_shapes, t);
+        let pressure = interpolate_pressure_from_shapes(control_shapes, t);
+        
+        // Apply pressure to effective dimensions
+        let effective_width = width * pressure.sqrt();
+        let effective_height = height * pressure.sqrt();
+        
+        // Calculate perpendicular direction for elliptical cross-section
+        let perp_angle = angle + std::f32::consts::PI / 2.0;
+        let half_width = effective_width / 2.0;
+        let half_height = effective_height / 2.0;
+        
+        // Create elliptical upper and lower boundary points
+        // Use average of width and height for simplified boundary (could be more complex)
+        let avg_radius = (half_width + half_height) / 2.0;
+        
+        let upper = Point2D::new(
+            center.x + avg_radius * perp_angle.cos(),
+            center.y + avg_radius * perp_angle.sin(),
+        );
+        let lower = Point2D::new(
+            center.x - avg_radius * perp_angle.cos(),
+            center.y - avg_radius * perp_angle.sin(),
+        );
+        
+        upper_boundary.push(upper);
+        lower_boundary.push(lower);
+    }
+    
+    IntervalSplineCurve {
+        control_shapes: control_shapes.to_vec(),
+        upper_boundary,
+        lower_boundary,
+        centerline,
+    }
+}
+
+fn interpolate_center_catmull_rom(shapes: &[ControlShape], t: f32) -> Point2D {
+    if shapes.len() < 2 {
+        return shapes[0].center;
+    }
+    
+    let segment_t = t * (shapes.len() - 1) as f32;
+    let segment_index = segment_t.floor() as usize;
+    let local_t = segment_t - segment_index as f32;
+    
+    if segment_index >= shapes.len() - 1 {
+        return shapes[shapes.len() - 1].center;
+    }
+    
+    // Get 4 control points for Catmull-Rom
+    let p0 = if segment_index == 0 { shapes[0].center } else { shapes[segment_index - 1].center };
+    let p1 = shapes[segment_index].center;
+    let p2 = shapes[segment_index + 1].center;
+    let p3 = if segment_index + 2 < shapes.len() { shapes[segment_index + 2].center } else { shapes[shapes.len() - 1].center };
+    
+    // Catmull-Rom interpolation formula
+    let t2 = local_t * local_t;
+    let t3 = t2 * local_t;
+    
+    let x = 0.5 * (
+        2.0 * p1.x +
+        (-p0.x + p2.x) * local_t +
+        (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2 +
+        (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3
+    );
+    
+    let y = 0.5 * (
+        2.0 * p1.y +
+        (-p0.y + p2.y) * local_t +
+        (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2 +
+        (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3
+    );
+    
+    Point2D::new(x, y)
+}
+
+fn interpolate_width_from_shapes(shapes: &[ControlShape], t: f32) -> f32 {
+    if shapes.len() < 2 {
+        return shapes[0].effective_width();
+    }
+    
+    let segment_t = t * (shapes.len() - 1) as f32;
+    let segment_index = segment_t.floor() as usize;
+    let local_t = segment_t - segment_index as f32;
+    
+    if segment_index >= shapes.len() - 1 {
+        return shapes[shapes.len() - 1].effective_width();
+    }
+    
+    let width1 = shapes[segment_index].effective_width();
+    let width2 = shapes[segment_index + 1].effective_width();
+    
+    width1 * (1.0 - local_t) + width2 * local_t
+}
+
+fn interpolate_height_from_shapes(shapes: &[ControlShape], t: f32) -> f32 {
+    if shapes.len() < 2 {
+        return shapes[0].effective_height();
+    }
+    
+    let segment_t = t * (shapes.len() - 1) as f32;
+    let segment_index = segment_t.floor() as usize;
+    let local_t = segment_t - segment_index as f32;
+    
+    if segment_index >= shapes.len() - 1 {
+        return shapes[shapes.len() - 1].effective_height();
+    }
+    
+    let height1 = shapes[segment_index].effective_height();
+    let height2 = shapes[segment_index + 1].effective_height();
+    
+    height1 * (1.0 - local_t) + height2 * local_t
+}
+
+fn interpolate_angle_from_shapes(shapes: &[ControlShape], t: f32) -> f32 {
+    if shapes.len() < 2 {
+        return shapes[0].angle;
+    }
+    
+    let segment_t = t * (shapes.len() - 1) as f32;
+    let segment_index = segment_t.floor() as usize;
+    let local_t = segment_t - segment_index as f32;
+    
+    if segment_index >= shapes.len() - 1 {
+        return shapes[shapes.len() - 1].angle;
+    }
+    
+    let angle1 = shapes[segment_index].angle;
+    let angle2 = shapes[segment_index + 1].angle;
+    
+    // Handle angle wrapping
+    let mut diff = angle2 - angle1;
+    if diff > std::f32::consts::PI {
+        diff -= 2.0 * std::f32::consts::PI;
+    } else if diff < -std::f32::consts::PI {
+        diff += 2.0 * std::f32::consts::PI;
+    }
+    
+    angle1 + diff * local_t
+}
+
+fn interpolate_pressure_from_shapes(shapes: &[ControlShape], t: f32) -> f32 {
+    if shapes.len() < 2 {
+        return shapes[0].pressure;
+    }
+    
+    let segment_t = t * (shapes.len() - 1) as f32;
+    let segment_index = segment_t.floor() as usize;
+    let local_t = segment_t - segment_index as f32;
+    
+    if segment_index >= shapes.len() - 1 {
+        return shapes[shapes.len() - 1].pressure;
+    }
+    
+    let pressure1 = shapes[segment_index].pressure;
+    let pressure2 = shapes[segment_index + 1].pressure;
+    
+    pressure1 * (1.0 - local_t) + pressure2 * local_t
+}
+
+fn rasterize_interval_spline(curve: &IntervalSplineCurve) -> BrushStroke {
+    let mut points = Vec::new();
+    
+    if curve.upper_boundary.is_empty() || curve.lower_boundary.is_empty() {
+        return BrushStroke { 
+            points, 
+            centerline: curve.centerline.clone(),
+            control_shapes: curve.control_shapes.clone(),
+        };
+    }
+    
+    // Find bounding box
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    
+    for point in curve.upper_boundary.iter().chain(curve.lower_boundary.iter()) {
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+    
+    // Sample every integer coordinate in bounding box and test if inside stroke
+    for y in (min_y.floor() as isize)..=(max_y.ceil() as isize) {
+        for x in (min_x.floor() as isize)..=(max_x.ceil() as isize) {
+            if is_point_inside_stroke(&Point2D::new(x as f32, y as f32), curve) {
+                points.push([x, y]);
+            }
+        }
+    }
+    
+    BrushStroke { 
+        points, 
+        centerline: curve.centerline.clone(),
+        control_shapes: curve.control_shapes.clone(),
+    }
+}
+
+fn is_point_inside_stroke(point: &Point2D, curve: &IntervalSplineCurve) -> bool {
+    // Use ray casting to determine if point is inside the stroke polygon
+    // formed by upper_boundary + reversed lower_boundary
+    
+    let mut polygon = curve.upper_boundary.clone();
+    let mut lower_reversed = curve.lower_boundary.clone();
+    lower_reversed.reverse();
+    polygon.extend(lower_reversed);
+    
+    if polygon.len() < 3 {
+        return false;
+    }
+    
+    let mut inside = false;
+    let mut j = polygon.len() - 1;
+    
+    for i in 0..polygon.len() {
+        if ((polygon[i].y > point.y) != (polygon[j].y > point.y)) &&
+           (point.x < (polygon[j].x - polygon[i].x) * (point.y - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    
+    inside
+}
+
+// ============================================================================
+// DRY BRUSH EFFECTS (Applied Sparingly)
+// ============================================================================
+
+fn apply_dry_brush_effect(stroke: &mut BrushStroke, rng: &mut impl Rng) {
+    let dryness = rng.gen_range(0.3..=0.7); // Random dryness level
+    
+    // Create gaps in the stroke (broken texture effect)
+    stroke.points.retain(|_| {
+        // Keep more points in center, fewer at edges
+        rng.random::<f32>() > dryness * 0.4 // Remove up to 28% of points when very dry
+    });
+    
+    // Add texture variation to remaining points
+    for point in &mut stroke.points {
+        if rng.random::<f32>() < dryness * 0.3 {
+            // Small random displacement for scratchy texture
+            point[0] += rng.gen_range(-1i32..=1i32) as isize;
+point[1] += rng.gen_range(-1i32..=1i32) as isize;
+        }
+    }
+    
+    // Add some bristle marks along the centerline (very sparingly)
+    if rng.random::<f32>() < 0.4 { // 40% chance for bristle marks
+        add_sparse_bristle_marks(stroke, rng);
+    }
+}
+
+fn add_sparse_bristle_marks(stroke: &mut BrushStroke, rng: &mut impl Rng) {
+    let mut bristle_points = Vec::new();
+    let bristle_spacing = 8; // Every 8th point along centerline
+    
+    for (i, center) in stroke.centerline.iter().enumerate() {
+        if i % bristle_spacing == 0 && rng.random::<f32>() < 0.6 { // 60% chance per eligible point
+            // Get approximate width at this position
+            let t = i as f32 / (stroke.centerline.len() - 1) as f32;
+            let width = if !stroke.control_shapes.is_empty() {
+                interpolate_width_from_shapes(&stroke.control_shapes, t)
+            } else {
+                4.0 // Fallback width
+            };
+            
+            // Add 2-3 bristle marks perpendicular to stroke direction
+            let num_bristles = rng.gen_range(2..=3);
+            for bristle_idx in 0..num_bristles {
+                let offset_ratio = (bristle_idx as f32 / (num_bristles - 1) as f32 - 0.5) * 0.8;
+                
+                // Calculate perpendicular direction
+                let perp_angle = if i < stroke.centerline.len() - 1 {
+                    let next = stroke.centerline[i + 1];
+                    let dx = next.x - center.x;
+                    let dy = next.y - center.y;
+                    dy.atan2(dx) + std::f32::consts::PI / 2.0
+                } else if i > 0 {
+                    let prev = stroke.centerline[i - 1];
+                    let dx = center.x - prev.x;
+                    let dy = center.y - prev.y;
+                    dy.atan2(dx) + std::f32::consts::PI / 2.0
+                } else {
+                    0.0
+                };
+                
+                let bristle_offset = offset_ratio * width * 0.3;
+                let bristle_x = center.x + bristle_offset * perp_angle.cos();
+                let bristle_y = center.y + bristle_offset * perp_angle.sin();
+                
+                // Add small line of bristle points
+                for line_step in 0..3 {
+                    let step_offset = (line_step as f32 - 1.0) * 0.5;
+                    let final_x = bristle_x + step_offset * perp_angle.cos();
+                    let final_y = bristle_y + step_offset * perp_angle.sin();
+                    
+                    bristle_points.push([final_x as isize, final_y as isize]);
+                }
+            }
+        }
+    }
+    
+    stroke.points.extend(bristle_points);
+}
+
+fn calculate_weighted_stroke_color_with_center_bias(target: &Image, stroke: &BrushStroke) -> [u8; 3] {
+    if stroke.centerline.is_empty() {
+        // Fallback to simple average if no centerline
+        return calculate_simple_average_color(target, &stroke.points);
+    }
+    
+    let mut total_r = 0.0;
+    let mut total_g = 0.0;
+    let mut total_b = 0.0;
+    let mut total_weight = 0.0;
+    
+    // Sample along centerline with higher weights toward center
+    let centerline_samples = 20; // Sample 20 points along centerline
+    for i in 0..centerline_samples {
+        let t = i as f32 / (centerline_samples - 1) as f32;
+        let centerline_idx = (t * (stroke.centerline.len() - 1) as f32) as usize;
+        let center_point = stroke.centerline[centerline_idx];
+        
+        let x = center_point.x as u32;
+        let y = center_point.y as u32;
+        
+        if x < target.width && y < target.height {
+            let [r, g, b] = target.color_at([x, y]);
+            
+            // Weight based on distance from stroke center (higher weight in middle)
+            let center_distance = (t - 0.5).abs(); // 0.0 at center, 0.5 at ends
+            let weight = 2.0 - center_distance * 2.0; // 2.0 at center, 1.0 at ends
+            
+            total_r += r as f32 * weight;
+            total_g += g as f32 * weight;
+            total_b += b as f32 * weight;
+            total_weight += weight;
+        }
+    }
+    
+    if total_weight > 0.0 {
+        [
+            (total_r / total_weight) as u8,
+            (total_g / total_weight) as u8,
+            (total_b / total_weight) as u8,
+        ]
+    } else {
+        calculate_simple_average_color(target, &stroke.points)
+    }
+}
+
+fn calculate_simple_average_color(target: &Image, stroke_points: &[[isize; 2]]) -> [u8; 3] {
     let mut valid_points = 0;
     let mut total_r = 0u32;
     let mut total_g = 0u32;
@@ -103,7 +718,6 @@ fn calculate_weighted_stroke_color(target: &Image, stroke_points: &[[isize; 2]])
     }
 
     if valid_points == 0 {
-        // If no valid points, sample from the center of the image as fallback
         let center_x = (target.width / 2) as u32;
         let center_y = (target.height / 2) as u32;
         return target.color_at([center_x, center_y]);
@@ -116,112 +730,9 @@ fn calculate_weighted_stroke_color(target: &Image, stroke_points: &[[isize; 2]])
     ]
 }
 
-fn tick(target: &Image, approx: &mut Image) -> bool {
-    let mut rng = rand::thread_rng();
-    
-    // Random start point
-    let start_x = rng.gen_range(0..target.width) as isize;
-    let start_y = rng.gen_range(0..target.height) as isize;
-    
-    // Random angle (0 to 2π)
-    let angle = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
-    
-    // Random length (reasonable stroke length - smaller than circles for more control)
-    let max_length = (target.width.min(target.height) / 6) as isize; // Reduced from /3 to /6
-    let length = rng.gen_range(3..=max_length.max(3) as usize) as isize; // Smaller minimum length
-    
-    // Random brush width (smaller range for more precision)
-    let width = rng.gen_range(1..=4) as isize; // Reduced from 1..=8 to 1..=4
-    
-    // Calculate end point
-    let end_x = start_x + (length as f32 * angle.cos()) as isize;
-    let end_y = start_y + (length as f32 * angle.sin()) as isize;
-
-    // Generate brush stroke points
-    let stroke_points = generate_brush_stroke_points(start_x, start_y, angle, length, width);
-
-    // Calculate weighted average color
-    let color = calculate_weighted_stroke_color(target, &stroke_points);
-
-    // Generate all points that would be affected by the brush stroke
-    let changes = stroke_points
-        .into_iter()
-        .filter(|&[x, y]| {
-            x >= 0 &&
-                y >= 0 &&
-                x < target.width as isize &&
-                y < target.height as isize
-        })
-        .map(|[x, y]| ([x as u32, y as u32], color));
-
-    // Check if drawing this brush stroke would improve the approximation
-    let loss_delta = Image::loss_delta(target, approx, changes.clone());
-
-    if loss_delta >= 0.0 {
-        return false;
-    }
-
-    // Apply the changes if the brush stroke improves the approximation
-    approx.apply(changes);
-    true
-}
-
-fn generate_line_points(x0: isize, y0: isize, x1: isize, y1: isize) -> Vec<[isize; 2]> {
-    let mut points = Vec::new();
-    
-    let dx = (x1 - x0).abs();
-    let dy = (y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx - dy;
-    
-    let mut x = x0;
-    let mut y = y0;
-    
-    loop {
-        points.push([x, y]);
-        
-        if x == x1 && y == y1 {
-            break;
-        }
-        
-        let e2 = 2 * err;
-        if e2 > -dy {
-            err -= dy;
-            x += sx;
-        }
-        if e2 < dx {
-            err += dx;
-            y += sy;
-        }
-    }
-    
-    points
-}
-
-fn generate_brush_stroke_points(start_x: isize, start_y: isize, angle: f32, length: isize, width: isize) -> Vec<[isize; 2]> {
-    let mut points = Vec::new();
-    
-    // Calculate end point from start + angle + length
-    let end_x = start_x + (length as f32 * angle.cos()) as isize;
-    let end_y = start_y + (length as f32 * angle.sin()) as isize;
-    
-    // Generate points along the stroke centerline (using Bresenham's line algorithm)
-    let centerline_points = generate_line_points(start_x, start_y, end_x, end_y);
-    
-    // For each centerline point, add points perpendicular to create brush width
-    let perp_angle = angle + std::f32::consts::PI / 2.0;
-    
-    for [cx, cy] in centerline_points {
-        for w in -(width/2)..=(width/2) {
-            let px = cx + (w as f32 * perp_angle.cos()) as isize;
-            let py = cy + (w as f32 * perp_angle.sin()) as isize;
-            points.push([px, py]);
-        }
-    }
-    
-    points
-}
+// ============================================================================
+// IMAGE PROCESSING AND DISPLAY CODE (unchanged)
+// ============================================================================
 
 type Point = [u32; 2];
 type Color = [u8; 3];
