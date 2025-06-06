@@ -97,14 +97,14 @@ fn tick(target: &Image, approx: &mut Image, stroke_count: usize) -> bool {
     let progress = (stroke_count as f32 / max_strokes_for_progression as f32).min(1.0);
 
     // Length progression: start large (1/4 image size), end small (1/12 image size)
-    let max_length_start = (target.width.min(target.height) / 2) as isize;
+    let max_length_start = (target.width.min(target.height) / 4) as isize;
     let max_length_end = (target.width.min(target.height) / 12) as isize;
     let max_length =
         (max_length_start as f32 * (1.0 - progress) + max_length_end as f32 * progress) as isize;
 
     // Width progression: start thick (50 pixels), end thin (2 pixels)
-    let max_width_start = 200;
-    let max_width_end = 5;
+    let max_width_start = 70;
+    let max_width_end = 2;
     let max_width =
         (max_width_start as f32 * (1.0 - progress) + max_width_end as f32 * progress) as isize;
 
