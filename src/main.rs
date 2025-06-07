@@ -1,45 +1,5 @@
 use clap::Parser;
 use image::{ImageReader, RgbImage};
-
-// Standalone paint mixing functions
-fn mix_colors(
-    base_color: [u8; 3],
-    base_thickness: f32,
-    new_color: [u8; 3],
-    new_thickness: f32,
-    wetness_factor: f32,
-) -> [u8; 3] {
-    // Color mixing based on paint properties - less aggressive mixing
-    let mixing_strength = wetness_factor * 0.4; // Reduced from 0.7 to preserve color intensity
-    
-    // Favor the new color more heavily to maintain vibrant colors
-    let base_weight = base_thickness * mixing_strength;
-    let new_weight = new_thickness; // New paint dominates more
-    let total_weight = base_weight + new_weight;
-    
-    if total_weight < 0.001 {
-        return new_color; // Default to new color if weights are negligible
-    }
-    
-    // Convert to subtractive mixing space (simplified)
-    let new_ratio = new_weight / total_weight;
-    let mixed_r = subtractive_mix(base_color[0], new_color[0], new_ratio);
-    let mixed_g = subtractive_mix(base_color[1], new_color[1], new_ratio);
-    let mixed_b = subtractive_mix(base_color[2], new_color[2], new_ratio);
-    
-    [mixed_r, mixed_g, mixed_b]
-}
-
-fn subtractive_mix(base: u8, new: u8, mix_ratio: f32) -> u8 {
-    // Simple subtractive mixing approximation
-    let base_f = 1.0 - (base as f32 / 255.0); // Convert to absorption
-    let new_f = 1.0 - (new as f32 / 255.0);
-    
-    let mixed_absorption = base_f * (1.0 - mix_ratio) + new_f * mix_ratio;
-    let mixed_reflection = 1.0 - mixed_absorption;
-    
-    (mixed_reflection * 255.0).clamp(0.0, 255.0) as u8
-}
 use minifb::{Key, Window, WindowOptions};
 use rand::Rng;
 use std::path::{Path, PathBuf};
@@ -53,7 +13,262 @@ struct Args {
 }
 
 // ============================================================================
-// PAINT MIXING SYSTEM
+// HIERARCHICAL PAINTING SYSTEM
+// ============================================================================
+
+#[derive(Clone, Debug)]
+struct StageParameters {
+    min_brush_size: isize,
+    max_brush_size: isize,
+    stroke_count: usize,
+    color_accuracy: f32,    // How closely to match target colors (0.0 = loose, 1.0 = exact)
+    edge_emphasis: f32,     // How much to follow edges vs random placement (0.0 = random, 1.0 = edge-only)
+    update_frequency: usize, // How often to update display during this stage
+}
+
+struct ImagePyramid {
+    levels: Vec<Image>,
+    stage_params: Vec<StageParameters>,
+}
+
+impl ImagePyramid {
+    fn new(original: &Image) -> Self {
+        let levels = vec![
+            // Stage 0: Composition - very blurred, coarse details
+            downsample_and_blur(original, 0.25, 4.0),
+            
+            // Stage 1: Form definition - medium blur, basic shapes
+            downsample_and_blur(original, 0.5, 2.0),
+            
+            // Stage 2: Surface details - slight blur, most details visible
+            apply_blur(original, 0.8),
+            
+            // Stage 3: Finishing touches - original resolution, edge-enhanced
+            enhance_edges(original, 1.2),
+        ];
+        
+        let stage_params = vec![
+            StageParameters {
+                min_brush_size: 150,
+                max_brush_size: 300,
+                stroke_count: 800,
+                color_accuracy: 0.7,
+                edge_emphasis: 0.2,
+                update_frequency: 5,
+            },
+            StageParameters {
+                min_brush_size: 50,
+                max_brush_size: 120,
+                stroke_count: 1600,
+                color_accuracy: 0.85,
+                edge_emphasis: 0.5,
+                update_frequency: 10,
+            },
+            StageParameters {
+                min_brush_size: 20,
+                max_brush_size: 40,
+                stroke_count: 3200,
+                color_accuracy: 0.95,
+                edge_emphasis: 0.8,
+                update_frequency: 20,
+            },
+            StageParameters {
+                min_brush_size: 5,
+                max_brush_size: 10,
+                stroke_count: 6400,
+                color_accuracy: 0.98,
+                edge_emphasis: 0.9,
+                update_frequency: 15,
+            },
+        ];
+        
+        Self { levels, stage_params }
+    }
+}
+
+fn downsample_and_blur(image: &Image, scale: f32, blur_radius: f32) -> Image {
+    // First downsample
+    let new_width = (image.width as f32 * scale) as u32;
+    let new_height = (image.height as f32 * scale) as u32;
+    let downsampled = downsample_image(image, new_width, new_height);
+    
+    // Then blur
+    let blurred = apply_blur(&downsampled, blur_radius);
+    
+    // Scale back up to original size for consistent processing
+    upsample_image(&blurred, image.width, image.height)
+}
+
+fn downsample_image(image: &Image, new_width: u32, new_height: u32) -> Image {
+    let mut pixels = vec![0u8; (new_width * new_height * 3) as usize];
+    
+    let x_ratio = image.width as f32 / new_width as f32;
+    let y_ratio = image.height as f32 / new_height as f32;
+    
+    for y in 0..new_height {
+        for x in 0..new_width {
+            // Sample with basic averaging for anti-aliasing
+            let src_x_base = (x as f32 * x_ratio) as u32;
+            let src_y_base = (y as f32 * y_ratio) as u32;
+            
+            let mut total_r = 0u32;
+            let mut total_g = 0u32;
+            let mut total_b = 0u32;
+            let mut count = 0u32;
+            
+            // Average a small area for better downsampling
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let src_x = (src_x_base + dx).min(image.width - 1);
+                    let src_y = (src_y_base + dy).min(image.height - 1);
+                    
+                    let [r, g, b] = image.color_at([src_x, src_y]);
+                    total_r += r as u32;
+                    total_g += g as u32;
+                    total_b += b as u32;
+                    count += 1;
+                }
+            }
+            
+            let dst_idx = ((y * new_width + x) * 3) as usize;
+            pixels[dst_idx] = (total_r / count) as u8;
+            pixels[dst_idx + 1] = (total_g / count) as u8;
+            pixels[dst_idx + 2] = (total_b / count) as u8;
+        }
+    }
+    
+    Image {
+        width: new_width,
+        height: new_height,
+        pixels,
+    }
+}
+
+fn upsample_image(image: &Image, new_width: u32, new_height: u32) -> Image {
+    let mut pixels = vec![0u8; (new_width * new_height * 3) as usize];
+    
+    let x_ratio = image.width as f32 / new_width as f32;
+    let y_ratio = image.height as f32 / new_height as f32;
+    
+    for y in 0..new_height {
+        for x in 0..new_width {
+            let src_x = ((x as f32 * x_ratio) as u32).min(image.width - 1);
+            let src_y = ((y as f32 * y_ratio) as u32).min(image.height - 1);
+            
+            let color = image.color_at([src_x, src_y]);
+            let dst_idx = ((y * new_width + x) * 3) as usize;
+            pixels[dst_idx] = color[0];
+            pixels[dst_idx + 1] = color[1];
+            pixels[dst_idx + 2] = color[2];
+        }
+    }
+    
+    Image {
+        width: new_width,
+        height: new_height,
+        pixels,
+    }
+}
+
+fn apply_blur(image: &Image, radius: f32) -> Image {
+    if radius < 0.1 {
+        return image.clone();
+    }
+    
+    let mut blurred_pixels = vec![0u8; image.pixels.len()];
+    let kernel_size = (radius * 2.0) as usize + 1;
+    let half_kernel = kernel_size / 2;
+    
+    // Simple box blur for performance
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let mut total_r = 0u32;
+            let mut total_g = 0u32;
+            let mut total_b = 0u32;
+            let mut count = 0u32;
+            
+            // Average surrounding pixels
+            for ky in 0..kernel_size {
+                for kx in 0..kernel_size {
+                    let sample_x = (x as isize + kx as isize - half_kernel as isize)
+                        .max(0)
+                        .min(image.width as isize - 1) as u32;
+                    let sample_y = (y as isize + ky as isize - half_kernel as isize)
+                        .max(0)
+                        .min(image.height as isize - 1) as u32;
+                    
+                    let [r, g, b] = image.color_at([sample_x, sample_y]);
+                    total_r += r as u32;
+                    total_g += g as u32;
+                    total_b += b as u32;
+                    count += 1;
+                }
+            }
+            
+            let dst_idx = ((y * image.width + x) * 3) as usize;
+            blurred_pixels[dst_idx] = (total_r / count) as u8;
+            blurred_pixels[dst_idx + 1] = (total_g / count) as u8;
+            blurred_pixels[dst_idx + 2] = (total_b / count) as u8;
+        }
+    }
+    
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: blurred_pixels,
+    }
+}
+
+fn enhance_edges(image: &Image, strength: f32) -> Image {
+    let mut enhanced_pixels = image.pixels.clone();
+    
+    // Simple edge enhancement using unsharp mask
+    for y in 1..(image.height - 1) {
+        for x in 1..(image.width - 1) {
+            let center = image.color_at([x, y]);
+            
+            // Calculate average of surrounding pixels
+            let mut avg_r = 0f32;
+            let mut avg_g = 0f32;
+            let mut avg_b = 0f32;
+            let mut count = 0f32;
+            
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 { continue; }
+                    let [r, g, b] = image.color_at([(x as i32 + dx) as u32, (y as i32 + dy) as u32]);
+                    avg_r += r as f32;
+                    avg_g += g as f32;
+                    avg_b += b as f32;
+                    count += 1.0;
+                }
+            }
+            
+            avg_r /= count;
+            avg_g /= count;
+            avg_b /= count;
+            
+            // Enhance difference from average
+            let enhanced_r = (center[0] as f32 + (center[0] as f32 - avg_r) * strength).clamp(0.0, 255.0) as u8;
+            let enhanced_g = (center[1] as f32 + (center[1] as f32 - avg_g) * strength).clamp(0.0, 255.0) as u8;
+            let enhanced_b = (center[2] as f32 + (center[2] as f32 - avg_b) * strength).clamp(0.0, 255.0) as u8;
+            
+            let idx = ((y * image.width + x) * 3) as usize;
+            enhanced_pixels[idx] = enhanced_r;
+            enhanced_pixels[idx + 1] = enhanced_g;
+            enhanced_pixels[idx + 2] = enhanced_b;
+        }
+    }
+    
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: enhanced_pixels,
+    }
+}
+
+// ============================================================================
+// PAINT MIXING SYSTEM (unchanged from previous version)
 // ============================================================================
 
 #[derive(Clone, Copy, Debug)]
@@ -149,8 +364,6 @@ impl PaintSurface {
             }
         }
     }
-    
-
     
     fn age_paint(&mut self) {
         for pixel_layers in &mut self.layers {
@@ -299,39 +512,69 @@ fn main() {
     let width = target.width;
     let height = target.height;
 
-    // Initialize paint surface instead of simple image
+    // Create hierarchical image pyramid
+    println!("Creating image pyramid for hierarchical painting...");
+    let pyramid = ImagePyramid::new(&target);
+
+    // Initialize paint surface
     let mut paint_surface = PaintSurface::new(width, height);
 
     let mut canvas = vec![0; (width * height) as usize];
-    let mut stroke_count = 0; // Track progress for brush size progression
+    let mut total_stroke_count = 0;
 
     let mut window = Window::new(
-        "brushez with paint mixing",
+        "brushez - hierarchical painting",
         width as usize,
         height as usize,
         WindowOptions::default(),
     )
     .unwrap();
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        let mut improvements_this_frame = 0;
-
-        for _ in 0..args.iterations {
-            if tick(&target, &mut paint_surface, stroke_count) {
-                stroke_count += 1;
-                improvements_this_frame += 1;
-                // Update display more frequently for smoother brush strokes
-                if improvements_this_frame % 10 == 0 {
+    // Paint through each stage of the hierarchy
+    for (stage_idx, (target_level, stage_params)) in pyramid.levels.iter().zip(&pyramid.stage_params).enumerate() {
+        println!("Stage {}: {} strokes with brushes {}-{}px", 
+                 stage_idx, stage_params.stroke_count, 
+                 stage_params.min_brush_size, stage_params.max_brush_size);
+        
+        let mut stage_improvements = 0;
+        let mut stroke_attempts = 0;
+        
+        for _stroke_num in 0..stage_params.stroke_count {
+            if window.is_key_down(Key::Escape) {
+                break;
+            }
+            
+            if tick_hierarchical(target_level, &mut paint_surface, stage_params, total_stroke_count) {
+                total_stroke_count += 1;
+                stage_improvements += 1;
+                
+                // Update display based on stage frequency
+                if stage_improvements % stage_params.update_frequency == 0 {
                     paint_surface.encode(&mut canvas);
                     window
                         .update_with_buffer(&canvas, width as usize, height as usize)
                         .unwrap();
                 }
             }
+            stroke_attempts += 1;
         }
-
-        // Final update for this frame
+        
+        println!("Stage {} completed: {}/{} successful strokes", 
+                 stage_idx, stage_improvements, stroke_attempts);
+        
+        // Final update for this stage
         paint_surface.encode(&mut canvas);
+        window
+            .update_with_buffer(&canvas, width as usize, height as usize)
+            .unwrap();
+            
+        if window.is_key_down(Key::Escape) {
+            break;
+        }
+    }
+
+    // Keep window open until escape is pressed
+    while window.is_open() && !window.is_key_down(Key::Escape) {
         window
             .update_with_buffer(&canvas, width as usize, height as usize)
             .unwrap();
@@ -342,7 +585,7 @@ fn main() {
         // Create the output filename
         let input_path = Path::new(&args.target);
         let input_stem = input_path.file_stem().unwrap().to_str().unwrap();
-        let output_filename = format!("generated_images/{}_brushez_mixed.jpg", input_stem);
+        let output_filename = format!("generated_images/{}_hierarchical.jpg", input_stem);
 
         // Convert the current state to an image
         let final_image = paint_surface.to_image();
@@ -361,52 +604,51 @@ fn main() {
         output_image
             .save(&output_filename)
             .expect("Failed to save output image");
-        println!("Saved final image to: {}", output_filename);
+        println!("Saved final hierarchical painting to: {}", output_filename);
     }
 }
 
-fn tick(target: &Image, paint_surface: &mut PaintSurface, stroke_count: usize) -> bool {
+fn tick_hierarchical(
+    target: &Image, 
+    paint_surface: &mut PaintSurface, 
+    stage_params: &StageParameters,
+    stroke_count: usize
+) -> bool {
     let mut rng = rand::thread_rng();
 
-    // Progressive brush sizing - start with large strokes, get smaller over time
-    let max_strokes_for_progression = 5000; // After this many strokes, use minimum sizes
-    let progress = (stroke_count as f32 / max_strokes_for_progression as f32).min(1.0);
+    // Replace this in the tick_hierarchical function:
+let length = rng.gen_range(
+    (stage_params.min_brush_size / 2).max(3) as i32..=stage_params.max_brush_size as i32
+) as isize;
 
-    // Length progression: start large (1/4 image size), end small (1/12 image size)
-    let max_length_start = (target.width.min(target.height) / 4) as isize;
-    let max_length_end = (target.width.min(target.height) / 12) as isize;
-    let max_length =
-        (max_length_start as f32 * (1.0 - progress) + max_length_end as f32 * progress) as isize;
+let width = rng.gen_range(
+    (stage_params.min_brush_size / 3).max(1) as i32..=(stage_params.max_brush_size / 2).max(2) as i32
+) as isize;
 
-    // Width progression: start thick (50 pixels), end thin (2 pixels)
-    let max_width_start = 70;
-    let max_width_end = 2;
-    let max_width =
-        (max_width_start as f32 * (1.0 - progress) + max_width_end as f32 * progress) as isize;
+    // Stroke placement based on stage emphasis
+    let (start_x, start_y) = if rng.random::<f32>() < stage_params.edge_emphasis {
+        // Edge-aware placement (simplified for now - could use edge detection)
+        select_high_contrast_point(target, &mut rng)
+    } else {
+        // Random placement
+        (
+            rng.gen_range(0..target.width) as isize,
+            rng.gen_range(0..target.height) as isize,
+        )
+    };
 
-    // Random start point
-    let start_x = rng.gen_range(0..target.width) as isize;
-    let start_y = rng.gen_range(0..target.height) as isize;
-
-    // Random angle (0 to 2π)
+    // Random angle (could be made edge-aware in future)
     let angle = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
-
-    // Random length within current progression bounds
-    let length = rng.gen_range(3..=max_length.max(3) as usize) as isize;
-
-    // Random brush width within current progression bounds
-    let width = rng.gen_range(1..=max_width.max(1) as usize) as isize;
 
     // Generate interval spline brush stroke
     let stroke = generate_interval_spline_stroke(start_x, start_y, angle, length, width, &mut rng);
     
-    // Calculate weighted average color with center bias
-    let color = calculate_weighted_stroke_color_with_center_bias(target, &stroke);
+    // Calculate color with stage-appropriate accuracy
+    let target_color = calculate_stage_appropriate_color(target, &stroke, stage_params);
 
-    // Determine paint amount based on brush pressure and size
-    let base_paint_amount = (width as f32 / 70.0) * 0.8 + 0.6; // Larger brushes have more paint, higher base
-    let paint_amount = base_paint_amount + rng.gen_range(-0.1..0.1); // Add some variation
-    let paint_amount = paint_amount.clamp(0.7, 1.0); // Much higher paint amounts for opacity
+    // Determine paint amount based on brush size and stage
+    let base_paint_amount = (width as f32 / stage_params.max_brush_size as f32) * 0.8 + 0.6;
+    let paint_amount = base_paint_amount.clamp(0.7, 1.0);
 
     // Generate all points that would be affected by the brush stroke
     let changes = stroke.points
@@ -414,7 +656,7 @@ fn tick(target: &Image, paint_surface: &mut PaintSurface, stroke_count: usize) -
         .filter(|&&[x, y]| {
             x >= 0 && y >= 0 && x < target.width as isize && y < target.height as isize
         })
-        .map(|&[x, y]| ([x as u32, y as u32], color, paint_amount));
+        .map(|&[x, y]| ([x as u32, y as u32], target_color, paint_amount));
 
     // Check if drawing this brush stroke would improve the approximation
     let loss_delta = paint_surface.loss_delta(target, changes.clone());
@@ -424,8 +666,100 @@ fn tick(target: &Image, paint_surface: &mut PaintSurface, stroke_count: usize) -
     }
 
     // Apply the changes if the brush stroke improves the approximation
-    paint_surface.apply_stroke(&stroke, color, paint_amount);
+    paint_surface.apply_stroke(&stroke, target_color, paint_amount);
     true
+}
+
+fn select_high_contrast_point(target: &Image, rng: &mut impl Rng) -> (isize, isize) {
+    // Simple high-contrast point selection - find areas with color variation
+    let mut best_x = target.width / 2;
+    let mut best_y = target.height / 2;
+    let mut best_contrast = 0.0;
+    
+    // Sample a few random points and pick the one with highest local contrast
+    for _ in 0..20 {
+        let x = rng.gen_range(1..(target.width - 1));
+        let y = rng.gen_range(1..(target.height - 1));
+        
+        let center = target.color_at([x, y]);
+        let mut total_diff = 0.0;
+        
+        // Check 4-connected neighbors
+        for &(dx, dy) in &[(0, 1), (0, -1), (1, 0), (-1, 0)] {
+            let neighbor = target.color_at([(x as i32 + dx) as u32, (y as i32 + dy) as u32]);
+            let diff = color_difference(center, neighbor);
+            total_diff += diff;
+        }
+        
+        if total_diff > best_contrast {
+            best_contrast = total_diff;
+            best_x = x;
+            best_y = y;
+        }
+    }
+    
+    (best_x as isize, best_y as isize)
+}
+
+fn color_difference(c1: [u8; 3], c2: [u8; 3]) -> f32 {
+    let dr = c1[0] as f32 - c2[0] as f32;
+    let dg = c1[1] as f32 - c2[1] as f32;
+    let db = c1[2] as f32 - c2[2] as f32;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+fn calculate_stage_appropriate_color(
+    target: &Image, 
+    stroke: &BrushStroke, 
+    stage_params: &StageParameters
+) -> [u8; 3] {
+    if stage_params.color_accuracy > 0.9 {
+        // High accuracy - use precise center-biased sampling
+        calculate_weighted_stroke_color_with_center_bias(target, stroke)
+    } else {
+        // Lower accuracy - use simpler sampling for more impressionistic effect
+        calculate_simple_average_color(target, &stroke.points)
+    }
+}
+
+// Standalone paint mixing functions
+fn mix_colors(
+    base_color: [u8; 3],
+    base_thickness: f32,
+    new_color: [u8; 3],
+    new_thickness: f32,
+    wetness_factor: f32,
+) -> [u8; 3] {
+    // Color mixing based on paint properties - less aggressive mixing
+    let mixing_strength = wetness_factor * 0.4; // Reduced from 0.7 to preserve color intensity
+    
+    // Favor the new color more heavily to maintain vibrant colors
+    let base_weight = base_thickness * mixing_strength;
+    let new_weight = new_thickness; // New paint dominates more
+    let total_weight = base_weight + new_weight;
+    
+    if total_weight < 0.001 {
+        return new_color; // Default to new color if weights are negligible
+    }
+    
+    // Convert to subtractive mixing space (simplified)
+    let new_ratio = new_weight / total_weight;
+    let mixed_r = subtractive_mix(base_color[0], new_color[0], new_ratio);
+    let mixed_g = subtractive_mix(base_color[1], new_color[1], new_ratio);
+    let mixed_b = subtractive_mix(base_color[2], new_color[2], new_ratio);
+    
+    [mixed_r, mixed_g, mixed_b]
+}
+
+fn subtractive_mix(base: u8, new: u8, mix_ratio: f32) -> u8 {
+    // Simple subtractive mixing approximation
+    let base_f = 1.0 - (base as f32 / 255.0); // Convert to absorption
+    let new_f = 1.0 - (new as f32 / 255.0);
+    
+    let mixed_absorption = base_f * (1.0 - mix_ratio) + new_f * mix_ratio;
+    let mixed_reflection = 1.0 - mixed_absorption;
+    
+    (mixed_reflection * 255.0).clamp(0.0, 255.0) as u8
 }
 
 // ============================================================================
@@ -1012,12 +1346,14 @@ fn calculate_simple_average_color(target: &Image, stroke_points: &[[isize; 2]]) 
 }
 
 // ============================================================================
-// IMAGE PROCESSING AND DISPLAY CODE (unchanged but adapted for paint surface)
+// IMAGE PROCESSING AND DISPLAY CODE (adapted for hierarchical approach)
 // ============================================================================
 
 type Point = [u32; 2];
 type Color = [u8; 3];
 
+// derive clone
+#[derive(Clone)]
 struct Image {
     width: u32,
     height: u32,
