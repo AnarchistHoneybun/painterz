@@ -1,5 +1,45 @@
 use clap::Parser;
 use image::{ImageReader, RgbImage};
+
+// Standalone paint mixing functions
+fn mix_colors(
+    base_color: [u8; 3],
+    base_thickness: f32,
+    new_color: [u8; 3],
+    new_thickness: f32,
+    wetness_factor: f32,
+) -> [u8; 3] {
+    // Color mixing based on paint properties - less aggressive mixing
+    let mixing_strength = wetness_factor * 0.4; // Reduced from 0.7 to preserve color intensity
+    
+    // Favor the new color more heavily to maintain vibrant colors
+    let base_weight = base_thickness * mixing_strength;
+    let new_weight = new_thickness; // New paint dominates more
+    let total_weight = base_weight + new_weight;
+    
+    if total_weight < 0.001 {
+        return new_color; // Default to new color if weights are negligible
+    }
+    
+    // Convert to subtractive mixing space (simplified)
+    let new_ratio = new_weight / total_weight;
+    let mixed_r = subtractive_mix(base_color[0], new_color[0], new_ratio);
+    let mixed_g = subtractive_mix(base_color[1], new_color[1], new_ratio);
+    let mixed_b = subtractive_mix(base_color[2], new_color[2], new_ratio);
+    
+    [mixed_r, mixed_g, mixed_b]
+}
+
+fn subtractive_mix(base: u8, new: u8, mix_ratio: f32) -> u8 {
+    // Simple subtractive mixing approximation
+    let base_f = 1.0 - (base as f32 / 255.0); // Convert to absorption
+    let new_f = 1.0 - (new as f32 / 255.0);
+    
+    let mixed_absorption = base_f * (1.0 - mix_ratio) + new_f * mix_ratio;
+    let mixed_reflection = 1.0 - mixed_absorption;
+    
+    (mixed_reflection * 255.0).clamp(0.0, 255.0) as u8
+}
 use minifb::{Key, Window, WindowOptions};
 use rand::Rng;
 use std::path::{Path, PathBuf};
@@ -10,6 +50,240 @@ struct Args {
 
     #[clap(short, long, default_value = "4096")]
     iterations: usize,
+}
+
+// ============================================================================
+// PAINT MIXING SYSTEM
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct PaintLayer {
+    color: [u8; 3],
+    thickness: f32,    // Paint thickness (0.0 to 1.0)
+    wetness: f32,      // How wet the paint is (0.0 to 1.0)
+    age: u32,          // How long since applied (in iterations)
+}
+
+struct PaintSurface {
+    width: u32,
+    height: u32,
+    layers: Vec<Vec<PaintLayer>>, // Stack of paint layers per pixel
+    max_layers: usize,
+}
+
+impl PaintSurface {
+    fn new(width: u32, height: u32) -> Self {
+        let pixel_count = (width * height) as usize;
+        let mut layers = Vec::with_capacity(pixel_count);
+        
+        // Initialize with white canvas
+        for _ in 0..pixel_count {
+            layers.push(vec![PaintLayer {
+                color: [240, 240, 240], // Slightly off-white to reduce harsh contrast
+                thickness: 1.0,
+                wetness: 0.0,  // Canvas starts dry
+                age: 1000,     // Very old (dry)
+            }]);
+        }
+        
+        Self {
+            width,
+            height,
+            layers,
+            max_layers: 5, // Limit paint buildup
+        }
+    }
+    
+    fn apply_stroke(&mut self, stroke: &BrushStroke, new_color: [u8; 3], paint_amount: f32) {
+        for &[x, y] in &stroke.points {
+            if x >= 0 && y >= 0 && x < self.width as isize && y < self.height as isize {
+                self.apply_paint_to_pixel(x as u32, y as u32, new_color, paint_amount);
+            }
+        }
+        
+        // Age all paint slightly (but not every stroke to maintain performance)
+        if rand::random::<f32>() < 0.1 { // Only 10% of the time
+            self.age_paint();
+        }
+    }
+    
+    fn apply_paint_to_pixel(&mut self, x: u32, y: u32, new_color: [u8; 3], paint_amount: f32) {
+        let idx = (y * self.width + x) as usize;
+        let pixel_layers = &mut self.layers[idx];
+        
+        // Check if we're painting on wet paint (more conservative threshold)
+        let top_layer = pixel_layers.last().unwrap();
+        let is_wet_on_wet = top_layer.wetness > 0.5 && top_layer.age < 8; // Higher wetness threshold, shorter age
+        
+        if is_wet_on_wet {
+            // Mix with existing wet paint
+            let mixed_color = mix_colors(
+                top_layer.color,
+                top_layer.thickness,
+                new_color,
+                paint_amount,
+                top_layer.wetness,
+            );
+            
+            // Update the top layer with mixed result
+            if let Some(last_layer) = pixel_layers.last_mut() {
+                last_layer.color = mixed_color;
+                last_layer.thickness = (last_layer.thickness + paint_amount * 0.5).min(1.0);
+                last_layer.wetness = (last_layer.wetness + paint_amount * 0.8).min(1.0);
+                last_layer.age = 0; // Reset age since we just painted
+            }
+        } else {
+            // Apply as new layer
+            let new_layer = PaintLayer {
+                color: new_color,
+                thickness: paint_amount,
+                wetness: paint_amount * 0.9, // New paint starts wet
+                age: 0,
+            };
+            
+            pixel_layers.push(new_layer);
+            
+            // Limit layer buildup
+            if pixel_layers.len() > self.max_layers {
+                pixel_layers.remove(0);
+            }
+        }
+    }
+    
+
+    
+    fn age_paint(&mut self) {
+        for pixel_layers in &mut self.layers {
+            for layer in pixel_layers.iter_mut() {
+                layer.age += 1;
+                
+                // Paint dries over time
+                if layer.age > 5 {
+                    layer.wetness *= 0.95; // Gradually dry out
+                }
+                
+                // Very old paint is completely dry
+                if layer.age > 20 {
+                    layer.wetness = 0.0;
+                }
+            }
+        }
+    }
+    
+    fn get_visible_color(&self, x: u32, y: u32) -> [u8; 3] {
+        let idx = (y * self.width + x) as usize;
+        let pixel_layers = &self.layers[idx];
+        
+        // Composite layers from bottom to top
+        let mut result_color = [240u8, 240u8, 240u8]; // Match the off-white canvas start
+        
+        for layer in pixel_layers {
+            if layer.thickness > 0.05 { // Slightly higher threshold for visibility
+                result_color = self.composite_over(result_color, layer.color, layer.thickness);
+            }
+        }
+        
+        result_color
+    }
+    
+    fn composite_over(&self, base: [u8; 3], overlay: [u8; 3], thickness: f32) -> [u8; 3] {
+        // Convert thickness to opacity with high minimum opacity for strong colors
+        let opacity = (thickness * 0.3 + 0.7).clamp(0.7, 1.0); // Minimum 70% opacity, up to 100%
+        let inv_opacity = 1.0 - opacity;
+        
+        [
+            (base[0] as f32 * inv_opacity + overlay[0] as f32 * opacity) as u8,
+            (base[1] as f32 * inv_opacity + overlay[1] as f32 * opacity) as u8,
+            (base[2] as f32 * inv_opacity + overlay[2] as f32 * opacity) as u8,
+        ]
+    }
+    
+    fn to_image(&self) -> Image {
+        let mut pixels = vec![0u8; (self.width * self.height * 3) as usize];
+        
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let color = self.get_visible_color(x, y);
+                let idx = ((y * self.width + x) * 3) as usize;
+                pixels[idx] = color[0];
+                pixels[idx + 1] = color[1];
+                pixels[idx + 2] = color[2];
+            }
+        }
+        
+        Image {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+    
+    // Method to calculate loss delta for stroke evaluation
+    fn loss_delta(
+        &self,
+        target: &Image,
+        changes: impl IntoIterator<Item = ([u32; 2], [u8; 3], f32)>, // position, color, paint_amount
+    ) -> f32 {
+        changes
+            .into_iter()
+            .map(|(pos, new_col, paint_amount)| {
+                let target_color = target.color_at(pos);
+                let current_color = self.get_visible_color(pos[0], pos[1]);
+                
+                // Simulate what the color would be after applying this paint
+                let simulated_color = if paint_amount > 0.01 {
+                    // Check if there would be wet-on-wet mixing
+                    let idx = (pos[1] * self.width + pos[0]) as usize;
+                    let top_layer = self.layers[idx].last().unwrap();
+                    let is_wet_on_wet = top_layer.wetness > 0.5 && top_layer.age < 8; // Match the updated threshold
+                    
+                    if is_wet_on_wet {
+                        mix_colors(
+                            current_color,
+                            top_layer.thickness,
+                            new_col,
+                            paint_amount,
+                            top_layer.wetness,
+                        )
+                    } else {
+                        // Convert thickness to opacity with high minimum for consistency
+                        let opacity = (paint_amount * 0.3 + 0.7).clamp(0.7, 1.0);
+                        let inv_opacity = 1.0 - opacity;
+                        [
+                            (current_color[0] as f32 * inv_opacity + new_col[0] as f32 * opacity) as u8,
+                            (current_color[1] as f32 * inv_opacity + new_col[1] as f32 * opacity) as u8,
+                            (current_color[2] as f32 * inv_opacity + new_col[2] as f32 * opacity) as u8,
+                        ]
+                    }
+                } else {
+                    current_color
+                };
+
+                let loss_without_changes = Self::pixel_loss(target_color, current_color);
+                let loss_with_changes = Self::pixel_loss(target_color, simulated_color);
+
+                loss_with_changes - loss_without_changes
+            })
+            .sum()
+    }
+    
+    fn pixel_loss(a: [u8; 3], b: [u8; 3]) -> f32 {
+        a.into_iter()
+            .zip(b)
+            .map(|(a, b)| (a as f32 - b as f32).powi(2))
+            .sum()
+    }
+    
+    fn encode(&self, buf: &mut [u32]) {
+        let mut buf = buf.iter_mut();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let [r, g, b] = self.get_visible_color(x, y);
+                *buf.next().unwrap() = u32::from_be_bytes([0, r, g, b]);
+            }
+        }
+    }
 }
 
 fn main() {
@@ -25,13 +299,14 @@ fn main() {
     let width = target.width;
     let height = target.height;
 
-    let mut approx = Image::from(RgbImage::new(width, height));
+    // Initialize paint surface instead of simple image
+    let mut paint_surface = PaintSurface::new(width, height);
 
     let mut canvas = vec![0; (width * height) as usize];
     let mut stroke_count = 0; // Track progress for brush size progression
 
     let mut window = Window::new(
-        "brushez",
+        "brushez with paint mixing",
         width as usize,
         height as usize,
         WindowOptions::default(),
@@ -42,12 +317,12 @@ fn main() {
         let mut improvements_this_frame = 0;
 
         for _ in 0..args.iterations {
-            if tick(&target, &mut approx, stroke_count) {
+            if tick(&target, &mut paint_surface, stroke_count) {
                 stroke_count += 1;
                 improvements_this_frame += 1;
                 // Update display more frequently for smoother brush strokes
                 if improvements_this_frame % 10 == 0 {
-                    approx.encode(&mut canvas);
+                    paint_surface.encode(&mut canvas);
                     window
                         .update_with_buffer(&canvas, width as usize, height as usize)
                         .unwrap();
@@ -56,7 +331,7 @@ fn main() {
         }
 
         // Final update for this frame
-        approx.encode(&mut canvas);
+        paint_surface.encode(&mut canvas);
         window
             .update_with_buffer(&canvas, width as usize, height as usize)
             .unwrap();
@@ -67,13 +342,14 @@ fn main() {
         // Create the output filename
         let input_path = Path::new(&args.target);
         let input_stem = input_path.file_stem().unwrap().to_str().unwrap();
-        let output_filename = format!("generated_images/{}_brushez.jpg", input_stem);
+        let output_filename = format!("generated_images/{}_brushez_mixed.jpg", input_stem);
 
         // Convert the current state to an image
+        let final_image = paint_surface.to_image();
         let mut output_image = RgbImage::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let [r, g, b] = approx.color_at([x, y]);
+                let [r, g, b] = final_image.color_at([x, y]);
                 output_image.put_pixel(x, y, image::Rgb([r, g, b]));
             }
         }
@@ -89,7 +365,7 @@ fn main() {
     }
 }
 
-fn tick(target: &Image, approx: &mut Image, stroke_count: usize) -> bool {
+fn tick(target: &Image, paint_surface: &mut PaintSurface, stroke_count: usize) -> bool {
     let mut rng = rand::thread_rng();
 
     // Progressive brush sizing - start with large strokes, get smaller over time
@@ -127,23 +403,28 @@ fn tick(target: &Image, approx: &mut Image, stroke_count: usize) -> bool {
     // Calculate weighted average color with center bias
     let color = calculate_weighted_stroke_color_with_center_bias(target, &stroke);
 
+    // Determine paint amount based on brush pressure and size
+    let base_paint_amount = (width as f32 / 70.0) * 0.8 + 0.6; // Larger brushes have more paint, higher base
+    let paint_amount = base_paint_amount + rng.gen_range(-0.1..0.1); // Add some variation
+    let paint_amount = paint_amount.clamp(0.7, 1.0); // Much higher paint amounts for opacity
+
     // Generate all points that would be affected by the brush stroke
     let changes = stroke.points
-        .into_iter()
-        .filter(|&[x, y]| {
+        .iter()
+        .filter(|&&[x, y]| {
             x >= 0 && y >= 0 && x < target.width as isize && y < target.height as isize
         })
-        .map(|[x, y]| ([x as u32, y as u32], color));
+        .map(|&[x, y]| ([x as u32, y as u32], color, paint_amount));
 
     // Check if drawing this brush stroke would improve the approximation
-    let loss_delta = Image::loss_delta(target, approx, changes.clone());
+    let loss_delta = paint_surface.loss_delta(target, changes.clone());
 
     if loss_delta >= 0.0 {
         return false;
     }
 
     // Apply the changes if the brush stroke improves the approximation
-    approx.apply(changes);
+    paint_surface.apply_stroke(&stroke, color, paint_amount);
     true
 }
 
@@ -592,7 +873,7 @@ fn apply_dry_brush_effect(stroke: &mut BrushStroke, rng: &mut impl Rng) {
         if rng.random::<f32>() < dryness * 0.3 {
             // Small random displacement for scratchy texture
             point[0] += rng.gen_range(-1i32..=1i32) as isize;
-point[1] += rng.gen_range(-1i32..=1i32) as isize;
+            point[1] += rng.gen_range(-1i32..=1i32) as isize;
         }
     }
     
@@ -731,7 +1012,7 @@ fn calculate_simple_average_color(target: &Image, stroke_points: &[[isize; 2]]) 
 }
 
 // ============================================================================
-// IMAGE PROCESSING AND DISPLAY CODE (unchanged)
+// IMAGE PROCESSING AND DISPLAY CODE (unchanged but adapted for paint surface)
 // ============================================================================
 
 type Point = [u32; 2];
@@ -744,58 +1025,9 @@ struct Image {
 }
 
 impl Image {
-    fn loss_delta(
-        target: &Self,
-        approx: &Self,
-        changes: impl IntoIterator<Item = (Point, Color)>,
-    ) -> f32 {
-        changes
-            .into_iter()
-            .map(|(pos, new_col)| {
-                let target_color = target.color_at(pos);
-                let approx_color = approx.color_at(pos);
-
-                let loss_without_changes = Self::pixel_loss(target_color, approx_color);
-                let loss_with_changes = Self::pixel_loss(target_color, new_col);
-
-                loss_with_changes - loss_without_changes
-            })
-            .sum()
-    }
-
-    fn pixel_loss(a: Color, b: Color) -> f32 {
-        a.into_iter()
-            .zip(b)
-            .map(|(a, b)| (a as f32 - b as f32).powi(2))
-            .sum()
-    }
-
-    fn apply(&mut self, changes: impl IntoIterator<Item = (Point, Color)>) {
-        for (pos, col) in changes {
-            *self.color_at_mut(pos) = col;
-        }
-    }
-
-    fn encode(&self, buf: &mut [u32]) {
-        let mut buf = buf.iter_mut();
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let [r, g, b] = self.color_at([x, y]);
-                *buf.next().unwrap() = u32::from_be_bytes([0, r, g, b]);
-            }
-        }
-    }
-
     fn color_at(&self, point: Point) -> Color {
         let offset = (point[1] * self.width + point[0]) as usize * 3;
         let color = &self.pixels[offset..][..3];
-        color.try_into().unwrap()
-    }
-
-    fn color_at_mut(&mut self, [x, y]: [u32; 2]) -> &mut Color {
-        let offset = (y * self.width + x) as usize * 3;
-        let color = &mut self.pixels[offset..][..3];
         color.try_into().unwrap()
     }
 }
